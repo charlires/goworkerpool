@@ -1,6 +1,7 @@
 package workerpool
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -21,37 +22,18 @@ func NewWorker(channel chan *Task, ID int) *Worker {
 	}
 }
 
-// Start starts the worker
-func (wr *Worker) Start(wg *sync.WaitGroup) {
-	fmt.Printf("Starting worker %d\n", wr.ID)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for task := range wr.taskChan {
-			process(wr.ID, task)
-		}
-	}()
-}
-
 // StartBackground starts the worker in background waiting
-func (wr *Worker) StartBackground() {
+func (wr *Worker) Start(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	fmt.Printf("Starting worker %d\n", wr.ID)
 
 	for {
 		select {
 		case task := <-wr.taskChan:
-			process(wr.ID, task)
-		case <-wr.quit:
+			task.Do(wr.ID)
+		case <-ctx.Done():
+			fmt.Printf("Worker %d received cancellation signal!\n", wr.ID)
 			return
 		}
 	}
-}
-
-// Stop quits the worker
-func (wr *Worker) Stop() {
-	fmt.Printf("Closing worker %d\n", wr.ID)
-	go func() {
-		wr.quit <- true
-	}()
 }

@@ -1,6 +1,7 @@
 package workerpool
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -11,70 +12,49 @@ type Pool struct {
 	Tasks   []*Task
 	Workers []*Worker
 
-	concurrency   int
-	collector     chan *Task
+	concurrency   int //number of workers
+	waitingTime   time.Duration
+	Collector     chan *Task
 	runBackground chan bool
 	wg            sync.WaitGroup
 }
 
 // NewPool initializes a new pool with the given tasks and
 // at the given concurrency.
-func NewPool(tasks []*Task, concurrency int) *Pool {
+func NewPool(
+	tasks []*Task, concurrency, tasksBuffer int, waitingTime time.Duration,
+) *Pool {
 	return &Pool{
 		Tasks:       tasks,
 		concurrency: concurrency,
-		collector:   make(chan *Task, 1000),
+		Collector:   make(chan *Task, tasksBuffer),
+		waitingTime: waitingTime,
 	}
-}
-
-// Run runs all work within the pool and blocks until it's
-// finished.
-func (p *Pool) Run() {
-	for i := 1; i <= p.concurrency; i++ {
-		worker := NewWorker(p.collector, i)
-		worker.Start(&p.wg)
-	}
-
-	for i := range p.Tasks {
-		p.collector <- p.Tasks[i]
-	}
-	close(p.collector)
-
-	p.wg.Wait()
 }
 
 // AddTask adds a task to the pool
 func (p *Pool) AddTask(task *Task) {
-	p.collector <- task
+	p.Collector <- task
 }
 
 // RunBackground runs the pool in background
-func (p *Pool) RunBackground() {
+func (p *Pool) Run(ctx context.Context, wg *sync.WaitGroup) {
 	go func() {
 		for {
 			fmt.Print("⌛ Waiting for tasks to come in ...\n")
-			time.Sleep(10 * time.Second)
+			time.Sleep(p.waitingTime)
 		}
 	}()
 
+	wg.Add(p.concurrency)
 	for i := 1; i <= p.concurrency; i++ {
-		worker := NewWorker(p.collector, i)
+		worker := NewWorker(p.Collector, i)
 		p.Workers = append(p.Workers, worker)
-		go worker.StartBackground()
+		go worker.Start(ctx, wg)
 	}
 
 	for i := range p.Tasks {
-		p.collector <- p.Tasks[i]
+		p.Collector <- p.Tasks[i]
 	}
 
-	p.runBackground = make(chan bool)
-	<-p.runBackground
-}
-
-// Stop stops background workers
-func (p *Pool) Stop() {
-	for i := range p.Workers {
-		p.Workers[i].Stop()
-	}
-	p.runBackground <- true
 }

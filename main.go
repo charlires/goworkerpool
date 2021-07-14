@@ -1,119 +1,96 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"math/rand"
+	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
-	"github.com/Joker666/goworkerpool/basic"
-	"github.com/Joker666/goworkerpool/model"
-	"github.com/Joker666/goworkerpool/worker"
+	"github.com/Joker666/goworkerpool/audit/dynamo"
+
+	"github.com/Joker666/goworkerpool/parser/fastly"
+	"github.com/Joker666/goworkerpool/storage/s3"
 	"github.com/Joker666/goworkerpool/workerpool"
-	"github.com/urfave/cli"
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 )
 
 func main() {
-	// Prepare the data
-	var allData []model.SimpleData
-	for i := 0; i < 1000; i++ {
-		data := model.SimpleData{ID: i}
-		allData = append(allData, data)
+	logger, err := createLogger("DEBUG")
+	if err != nil {
+		log.Fatal("creating logger: %w", err)
 	}
+
+	s3Service := s3.New()
+	fastlyParser := fastly.New()
+	dynamo := dynamo.New()
 
 	var allTask []*workerpool.Task
-	for i := 1; i <= 100; i++ {
-		task := workerpool.NewTask(func(data interface{}) error {
-			taskID := data.(int)
-			time.Sleep(100 * time.Millisecond)
-			fmt.Printf("Task %d processed\n", taskID)
-			return nil
-		}, i)
-		allTask = append(allTask, task)
+	// for i := 1; i <= 20; i++ {
+	// 	task := workerpool.NewTask(uuid.NewString())
+	// 	allTask = append(allTask, task)
+	// }
+
+	pool := workerpool.NewPool(allTask, 5, 100, 10*time.Second)
+
+	// ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// ctx, cancel := context.WithDeadline(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+
+	pool.Run(ctx, wg)
+
+	fmt.Println("running server")
+
+	r := mux.NewRouter()
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		task := workerpool.NewTask(uuid.New().String(), s3Service, s3Service, fastlyParser, dynamo)
+		pool.AddTask(task)
+		fmt.Fprintf(w, "Hi there, task ID %s!", task.ID)
+		fmt.Fprintf(w, "CreatedAt %s!", task.CreatedAt)
+	})
+
+	server := http.Server{
+		Addr:              ":8080",
+		Handler:           r,
+		WriteTimeout:      75 * time.Second,
+		ReadTimeout:       75 * time.Second,
+		ReadHeaderTimeout: 75 * time.Second,
 	}
+	// Launch server start in a separate goroutine
+	go func() {
+		logger.
+			WithField("bind_address", server.Addr).
+			Info("starting server")
+		err := server.ListenAndServe()
+		logger.
+			WithError(err).
+			Error("starting server")
+	}()
 
-	pool := workerpool.NewPool(allTask, 5)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(
+		stop,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGHUP,
+	)
 
-	app := &cli.App{
-		Name:  "goworkerpool",
-		Usage: "check different work loads with worker pool",
-		Action: func(c *cli.Context) error {
-			fmt.Println("You need more parameters")
-			return nil
-		},
-		Commands: []cli.Command{
-			{
-				Name:  "basic",
-				Usage: "run synchronously",
-				Action: func(c *cli.Context) error {
-					basic.Work(allData)
-					return nil
-				},
-			},
-			{
-				Name:  "notpooled",
-				Usage: "run without any pooling",
-				Action: func(c *cli.Context) error {
-					worker.NotPooledWork(allData)
-					return nil
-				},
-			},
-			{
-				Name:  "pooled",
-				Usage: "run with pooling",
-				Action: func(c *cli.Context) error {
-					worker.PooledWork(allData)
-					return nil
-				},
-			},
-			{
-				Name:  "poolederror",
-				Usage: "run with pooling that handles errors",
-				Action: func(c *cli.Context) error {
-					worker.PooledWorkError(allData)
-					return nil
-				},
-			},
-			{
-				Name:  "wpool",
-				Usage: "run robust worker pool",
-				Action: func(c *cli.Context) error {
-					pool.Run()
-					return nil
-				},
-			},
-			{
-				Name:  "wpoolbg",
-				Usage: "run robust worker pool in background",
-				Action: func(c *cli.Context) error {
-					go func() {
-						for {
-							taskID := rand.Intn(100) + 20
+	<-stop
+	// Handle shutdown
+	fmt.Println("*********************************\nShutdown signal received\n*********************************")
+	cancel()              // Signal cancellation to context.Context
+	close(pool.Collector) // closing main task channel
 
-							if taskID%7 == 0 {
-								pool.Stop()
-							}
-
-							time.Sleep(time.Duration(rand.Intn(5)) * time.Second)
-							task := workerpool.NewTask(func(data interface{}) error {
-								taskID := data.(int)
-								time.Sleep(100 * time.Millisecond)
-								fmt.Printf("Task %d processed\n", taskID)
-								return nil
-							}, taskID)
-							pool.AddTask(task)
-						}
-					}()
-					pool.RunBackground()
-					return nil
-				},
-			},
-		},
-	}
-
-	err := app.Run(os.Args)
-	if err != nil {
-		log.Fatal(err)
-	}
+	wg.Wait() // Block here until are workers are done
+	logger.Error("All workers done, shutting down!")
+	err = server.Shutdown(ctx)
+	logger.
+		WithError(err).
+		Error("server gracefully stopped")
 }

@@ -10,7 +10,8 @@
             "request": "launch",
             "mode": "auto",
             "program": "${workspaceFolder}",
-            "args": ["basic"]
+            // "args": ["basic"]
+            "debugAdapter": "dlv-dap"
         }
     ]
 }
